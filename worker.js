@@ -1515,7 +1515,40 @@ async function getSafeEnv(env, key, fallback) {
     if (env.DB) { try { const { results } = await env.DB.prepare("SELECT value FROM config WHERE key = ?").bind(key).all(); if (results && results.length > 0 && results[0].value) return results[0].value; } catch(e) {} }
     return fallback;
 }
-const splitCSV = (value) => (value || '').split(',').map(s => s.trim()).filter(Boolean);
+/* ---------- 多值分隔工具（CF 新版环境变量 UI 只能单行输入，不再支持回车换行） ----------
+ * 分隔符不区分中英文：换行 / 半角空格 / Tab / 全角空格 / 英文逗号 , / 中文逗号 ， / 顿号 、
+ * splitMulti    : 全部分隔符一律切开。用于 URL、IP 等本身不含空格和逗号的值
+ * splitNodeList : ADD 专用。先按行切（保留 # 注释行过滤），行内再切；
+ *                 「不像新条目开头」的碎片回贴到上一条备注名，防止 #备注名 含空格/逗号被误切
+ */
+const SEP_RE = /[\s,，、]+/;
+const splitMulti = (value) => String(value || '').split(SEP_RE).map(s => s.trim()).filter(Boolean);
+const splitCSV = splitMulti; // 兼容旧调用名（WL_IP / ADMIN_IP）
+const splitNodeList = (value) => {
+    const looksLikeAddr = (s) => { const h = String(s).split('#')[0]; return h.includes('.') || h.includes(':'); };
+    // 逗号/顿号仅在「后续每一段都像新条目」时才视为分隔符，否则原样保留在备注名里（不破坏 #美国，洛杉矶）
+    const byComma = (tok) => {
+        if (!/[,，、]/.test(tok)) return [tok];
+        const parts = tok.split(/[,，、]/);
+        return parts.slice(1).every(looksLikeAddr) ? parts : [tok];
+    };
+    const out = [];
+    for (const rawLine of String(value || '').split(/[\n\r]+/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue; // 空行 / 整行注释
+        let cur = '';
+        for (const raw of line.split(/\s+/)) { // \s 已覆盖全角空格 U+3000
+            if (!raw) continue;
+            for (const tok of byComma(raw)) {
+                if (!tok) continue;
+                if (looksLikeAddr(tok) || !cur) { if (cur) out.push(cur); cur = tok; }
+                else cur += ' ' + tok; // 不像新条目 → 并回上一条的备注名
+            }
+        }
+        if (cur) out.push(cur);
+    }
+    return out;
+};
 const _throttleMap = new Map();
 let _tCnt = 0;
 function isThrottled(ip, action, ttlMs = 30000) {
@@ -2237,12 +2270,12 @@ async function getCustomIPs(env, dlsThreshold) {
     let allIPs = [];
     const threshold = Number(dlsThreshold) || 7; // 默认7 MB/s
     const addText = await getSafeEnv(env, 'ADD', "");
-    if (addText) { addText.split('\n').forEach(line => { const trimmed = line.trim(); if (trimmed && !trimmed.startsWith('#')) allIPs.push(trimmed); }); }
+    if (addText) { splitNodeList(addText).forEach(entry => { allIPs.push(entry); }); }
     const addApi = await getSafeEnv(env, 'ADDAPI', "");
-    if (addApi) { const urls = addApi.split('\n').filter(u => u.trim().startsWith('http')); for (const url of urls) { try { const res = await fetch(url.trim(), { headers: { 'User-Agent': 'Mozilla/5.0' } }); if (res.ok) { const text = await res.text(); text.split('\n').forEach(line => { const trimmed = line.trim(); if (trimmed && !trimmed.startsWith('#')) allIPs.push(trimmed); }); } } catch (e) {} } }
+    if (addApi) { const urls = splitMulti(addApi).filter(u => u.startsWith('http')); for (const url of urls) { try { const res = await fetch(url.trim(), { headers: { 'User-Agent': 'Mozilla/5.0' } }); if (res.ok) { const text = await res.text(); text.split('\n').forEach(line => { const trimmed = line.trim(); if (trimmed && !trimmed.startsWith('#')) allIPs.push(trimmed); }); } } catch (e) {} } }
     const addCsv = await getSafeEnv(env, 'ADDCSV', "");
     if (addCsv) { 
-        const urls = addCsv.split('\n').filter(u => u.trim().startsWith('http')); 
+        const urls = splitMulti(addCsv).filter(u => u.startsWith('http'));
         for (const url of urls) { 
             try { 
                 const res = await fetch(url.trim(), { headers: { 'User-Agent': 'Mozilla/5.0' } }); 
@@ -4343,16 +4376,21 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, subToken, 
                     <div style="font-size:0.8rem;color:var(--danger);margin-bottom:15px;padding:10px;background:rgba(255,0,64,0.1);border-left:3px solid var(--danger)">
                         ⚠️ 注意：若要在此生效，请确保 Cloudflare 后台或者硬编码未设置SUB订阅器 (详情顶部配置DEFAULT_SUB_DOMAIN)
                     </div>
-                    <div class="input-block">
-                        <label>ADD - 本地优选 IP (格式: IP:Port#Name，一行一个)</label>
-                        <textarea id="inpAdd" placeholder="1.1.1.1:443#US">${safeVal(add)}</textarea>
+                    <div style="font-size:0.8rem;color:var(--glass-cyan);margin-bottom:15px;padding:10px;background:rgba(0,245,255,0.06);border-left:3px solid var(--glass-blue);line-height:1.7">
+                        💡 <b>分隔符说明</b>：下面三个框支持 <b>回车换行</b>、<b>空格</b>、<b>逗号</b> 任意一种分隔，中英文符号不区分（半角/全角空格、<code>,</code> <code>，</code> <code>、</code> 均可）。<br>
+                        由于 Cloudflare 新版环境变量界面只能单行输入，在 CF 后台填写时请改用 <b>空格</b> 或 <b>逗号</b> 分隔；本页面用换行分隔同样有效。<br>
+                        ⚠️ 备注名里含空格或逗号不会被误切（如 <code>1.2.3.4:443#美国 洛杉矶</code> 正常）；分隔时只用<b>一个</b>符号即可，逗号后不要再加空格。
                     </div>
                     <div class="input-block">
-                        <label>ADDAPI - 远程优选 TXT 链接 (支持多行)</label>
+                        <label>ADD - 本地优选 IP (格式: IP:Port#Name，换行 / 空格 / 逗号 分隔)</label>
+                        <textarea id="inpAdd" placeholder="1.1.1.1:443#US 2.2.2.2:443#HK">${safeVal(add)}</textarea>
+                    </div>
+                    <div class="input-block">
+                        <label>ADDAPI - 远程优选 TXT 链接 (换行 / 空格 / 逗号 分隔)</label>
                         <textarea id="inpAddApi" placeholder="https://example.com/ips.txt">${safeVal(addApi)}</textarea>
                     </div>
                     <div class="input-block">
-                        <label>ADDCSV - 远程优选 CSV 链接 (支持多行)</label>
+                        <label>ADDCSV - 远程优选 CSV 链接 (换行 / 空格 / 逗号 分隔)</label>
                         <textarea id="inpAddCsv" placeholder="https://example.com/ips.csv">${safeVal(addCsv)}</textarea>
                     </div>
                     <!-- ⭐ 功能4: DLS 设置输入框 -->
