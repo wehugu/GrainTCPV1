@@ -1949,7 +1949,7 @@ export default {
           if (flag === 'validate_tg' && r.method === 'POST') { if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 }); const body = await r.json(); await sendTgMsg(ctx, { TG_BOT_TOKEN: body.TG_BOT_TOKEN, TG_CHAT_ID: body.TG_CHAT_ID }, "🤖 TG 推送可用性验证", r, "配置有效", true); return new Response(JSON.stringify({success:true, msg:"验证消息已发送"}), {headers:{'Content-Type':'application/json'}}); }
           if (flag === 'validate_cf' && r.method === 'POST') { if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 }); const body = await r.json(); const res = await getCloudflareUsage(body); return new Response(JSON.stringify({success:res.success, msg: res.success ? `验证通过: 总请求 ${res.total}` : `验证失败: ${res.msg}`}), {headers:{'Content-Type':'application/json'}}); }
           if (flag === 'set_webhook' && r.method === 'POST') { if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 }); const token = await getSafeEnv(env, 'TG_BOT_TOKEN', TG_BOT_TOKEN); if (!token) return new Response(JSON.stringify({success:false, msg:'未配置 TG_BOT_TOKEN'}), {headers:{'Content-Type':'application/json'}}); const webhookUrl = `https://${url.hostname}/tg/webhook`; const wres = await tgApi(token, 'setWebhook', { url: webhookUrl, allowed_updates: ['message'] }); return new Response(JSON.stringify({success: !!(wres && wres.ok), msg: (wres && wres.ok) ? `Webhook 已设置: ${webhookUrl}` : ((wres && wres.description) || '设置失败')}), {headers:{'Content-Type':'application/json'}}); }
-          if (flag === 'save_config' && r.method === 'POST') { if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 }); try { const body = await r.json(); const ALLOWED_KEYS = new Set(['ADD','ADDAPI','ADDCSV','DLS','TG_BOT_TOKEN','TG_CHAT_ID','CF_ID','CF_TOKEN','CF_EMAIL','CF_KEY','PROXYIP','SUB_DOMAIN','SUBAPI','PS','LOGIN_PAGE_TITLE','DASHBOARD_TITLE','TG_GROUP_URL','SITE_URL','GITHUB_URL','PROXY_CHECK_URL','CLASH_CONFIG','SINGBOX_CONFIG_V11','SINGBOX_CONFIG_V12','WL_IP','ECH_ENABLED','ECH_SNI','ECH_DNS','STATS_ENABLED','STATS_CHAT_ID','CF_ZONE_ID']); for (const [k, v] of Object.entries(body)) { if (!ALLOWED_KEYS.has(k)) continue; if (env.DB) await env.DB.prepare("INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(k, v, v).run(); } return new Response(JSON.stringify({status: 'ok'}), { headers: { 'Content-Type': 'application/json' } }); } catch(e) { return new Response(JSON.stringify({status: 'error', msg: e.toString()}), { headers: { 'Content-Type': 'application/json' } }); } }
+          if (flag === 'save_config' && r.method === 'POST') { if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 }); try { const body = await r.json(); const ALLOWED_KEYS = new Set(['ADD','ADDAPI','ADDCSV','ADDSUB','DLS','TG_BOT_TOKEN','TG_CHAT_ID','CF_ID','CF_TOKEN','CF_EMAIL','CF_KEY','PROXYIP','SUB_DOMAIN','SUBAPI','PS','LOGIN_PAGE_TITLE','DASHBOARD_TITLE','TG_GROUP_URL','SITE_URL','GITHUB_URL','PROXY_CHECK_URL','CLASH_CONFIG','SINGBOX_CONFIG_V11','SINGBOX_CONFIG_V12','WL_IP','ECH_ENABLED','ECH_SNI','ECH_DNS','STATS_ENABLED','STATS_CHAT_ID','CF_ZONE_ID']); for (const [k, v] of Object.entries(body)) { if (!ALLOWED_KEYS.has(k)) continue; if (env.DB) await env.DB.prepare("INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(k, v, v).run(); } return new Response(JSON.stringify({status: 'ok'}), { headers: { 'Content-Type': 'application/json' } }); } catch(e) { return new Response(JSON.stringify({status: 'error', msg: e.toString()}), { headers: { 'Content-Type': 'application/json' } }); } }
       }
 
       if (_SUB_PW && url.pathname === `/${_SUB_PW}`) {
@@ -2008,6 +2008,10 @@ export default {
           };
           if (!UA_L.includes('mozilla')) _subHeaders['Content-Disposition'] = `attachment; filename*=utf-8''${encodeURIComponent(_PS || 'AK1.32V2')}`;
 
+          // ADDSUB 汇聚订阅：统一取一次，供下面三条路径复用
+          const _agg = await getAggregated(env);
+          const _aggPrefix = _agg.links.length ? _agg.links.join('\n') + '\n' : '';
+
           // ===== 路径A：需要订阅转换的客户端（clash/singbox/surge/quanx/loon）=====
           if (订阅类型) {
               const subApiTarget = 订阅类型 === 'surge' ? 'surge&ver=4' : 订阅类型;
@@ -2015,9 +2019,22 @@ export default {
                   ? Array.from(new Set([_SINGBOX_CONFIG_V11, _SINGBOX_CONFIG_V12].filter(Boolean)))
                   : [_CLASH_CONFIG];
 
+              // 汇聚源以 | 追加为多源参数（转换后端逐个抓取合并）。
+              // 只追加机场订阅 URL 与现成节点：sub:// 生成器和优选IP列表返回的是地址而非节点，后端无法解析。
+              let _urlParam = _subUrl;
+              {
+                  const extra = [];
+                  for (const u of _agg.fetchUrls) { const s = u.split('#')[0].trim(); if (s) extra.push(s); }
+                  for (const l of _agg.rawLinks) { const s = l.trim(); if (s) extra.push(s); }
+                  for (const one of extra) {
+                      if (_urlParam.length + one.length + 1 > 6000) break; // 防超长被后端拒绝
+                      _urlParam += '|' + one;
+                  }
+              }
+
               let lastRes = null;
               for (const config of configList) {
-                  const subApi = `${_CONVERTER}/${'sub?tar'+'get='}${subApiTarget}&url=${encodeURIComponent(_subUrl)}&config=${encodeURIComponent(config)}${'&emo'+'ji=true&li'+'st=false&so'+'rt=false&fd'+'n=false&sc'+'v=false'}`;
+                  const subApi = `${_CONVERTER}/${'sub?tar'+'get='}${subApiTarget}&url=${encodeURIComponent(_urlParam)}&config=${encodeURIComponent(config)}${'&emo'+'ji=true&li'+'st=false&so'+'rt=false&fd'+'n=false&sc'+'v=false'}`;
                   try {
                       const res = await fetch(subApi, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' } });
                       if (res.ok) { lastRes = res; break; }
@@ -2092,7 +2109,8 @@ export default {
                     return line;
                   });
                   // 所有客户端（包括浏览器）统一返回 UTF-8 Base64 订阅
-                  body = btoa(unescape(encodeURIComponent(lines.join('\n'))));
+                  // ADDSUB 汇聚节点原样透传，排在最前
+                  body = btoa(unescape(encodeURIComponent(_aggPrefix + lines.join('\n'))));
                   _subHeaders['Content-Type'] = 'text/plain; charset=utf-8';
                   return new Response(body, { status: 200, headers: _subHeaders });
                 } catch(e) {}
@@ -2101,8 +2119,9 @@ export default {
 
           // ===== 兜底：本地生成 =====
           const allIPs = await getCustomIPs(env, _DLS);
-          const listText = genNodes(host, _UUID, requestProxyIp, allIPs, _PS);
-          const fallbackBody = btoa(unescape(encodeURIComponent(listText)));
+          const _fbIPs = _agg.ips.length ? [...new Set(allIPs.concat(_agg.ips))] : allIPs;
+          const listText = genNodes(host, _UUID, requestProxyIp, _fbIPs, _PS, _agg.pipSet);
+          const fallbackBody = btoa(unescape(encodeURIComponent(_aggPrefix + listText)));
           _subHeaders['Content-Type'] = 'text/plain; charset=utf-8';
           return new Response(fallbackBody, { status: 200, headers: _subHeaders });
       }
@@ -2188,8 +2207,12 @@ export default {
           const pathParam = url.searchParams.get('path');
           if (pathParam && pathParam.includes('/proxyip=')) proxyIp = pathParam.split('/proxyip=')[1];
           const allIPs = await getCustomIPs(env, _DLS); // 传入 DLS
-          const listText = genNodes(host, _UUID, proxyIp, allIPs, _PS);
-          return new Response(btoa(unescape(encodeURIComponent(listText))), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+          // ADDSUB 汇聚：透传节点在前，优选地址合并进节点模板
+          const _agg2 = await getAggregated(env);
+          const _regIPs = _agg2.ips.length ? [...new Set(allIPs.concat(_agg2.ips))] : allIPs;
+          const listText = genNodes(host, _UUID, proxyIp, _regIPs, _PS, _agg2.pipSet);
+          const _regBody = (_agg2.links.length ? _agg2.links.join('\n') + '\n' : '') + listText;
+          return new Response(btoa(unescape(encodeURIComponent(_regBody))), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
       }
 
       if (r.headers.get('Upgrade') !== 'websocket') {
@@ -2208,7 +2231,7 @@ export default {
         const cfId = _maskVal(_cfIdRaw); const cfToken = _maskVal(_cfTokenRaw);
         const cfMail = _maskVal(_cfMailRaw); const cfKey = _maskVal(_cfKeyRaw);
         const tgState = !!(_tgTokenRaw && _tgIdRaw); const cfState = (!!(_cfIdRaw && _cfTokenRaw)) || (!!(_cfMailRaw && _cfKeyRaw));
-        const _ADD = await getSafeEnv(env, 'ADD', ""); const _ADDAPI = await getSafeEnv(env, 'ADDAPI', ""); const _ADDCSV = await getSafeEnv(env, 'ADDCSV', "");
+        const _ADD = await getSafeEnv(env, 'ADD', ""); const _ADDAPI = await getSafeEnv(env, 'ADDAPI', ""); const _ADDCSV = await getSafeEnv(env, 'ADDCSV', ""); const _ADDSUB = await getSafeEnv(env, 'ADDSUB', "");
 
         // 传入 _DLS 参数到 dashPage
         const _ECH_ENABLED = await getSafeEnv(env, 'ECH_ENABLED', ECH ? 'true' : 'false');
@@ -2217,7 +2240,7 @@ export default {
         const _STATS_ENABLED = await getSafeEnv(env, 'STATS_ENABLED', 'false');
         const _STATS_CHAT_ID = await getSafeEnv(env, 'STATS_CHAT_ID', '');
         const _CF_ZONE = _maskVal(await getSafeEnv(env, 'CF_ZONE_ID', ''));
-        return new Response(dashPage(url.hostname, _UUID, _PROXY_IP, _SUB_PW, _SUB_DOMAIN, _CONVERTER, _SUB_TOKEN, env, clientIP, hasAuthCookie, tgState, cfState, _ADD, _ADDAPI, _ADDCSV, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams, _DASH_TITLE, _PROXY_CHECK_URL, _DLS, _ECH_ENABLED, _ECH_SNI_VAL, _ECH_DNS_VAL, _STATS_ENABLED, _STATS_CHAT_ID, _CF_ZONE), { status: 200, headers: noCacheHeaders });
+        return new Response(dashPage(url.hostname, _UUID, _PROXY_IP, _SUB_PW, _SUB_DOMAIN, _CONVERTER, _SUB_TOKEN, env, clientIP, hasAuthCookie, tgState, cfState, _ADD, _ADDAPI, _ADDCSV, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams, _DASH_TITLE, _PROXY_CHECK_URL, _DLS, _ECH_ENABLED, _ECH_SNI_VAL, _ECH_DNS_VAL, _STATS_ENABLED, _STATS_CHAT_ID, _CF_ZONE, _ADDSUB), { status: 200, headers: noCacheHeaders });
       }
       
 
@@ -2237,7 +2260,7 @@ export default {
 // 📋 UI & 节点生成
 // =============================================================================
 
-function genNodes(host, uuid, proxyIP, customIPs, psName) {
+function genNodes(host, uuid, proxyIP, customIPs, psName, pipSet) {
   let echParam = '';
   if (ECH) {
     echParam = `&ech=${encodeURIComponent((ECH_SNI ? ECH_SNI + '+' : '') + ECH_DNS)}`;
@@ -2257,7 +2280,11 @@ function genNodes(host, uuid, proxyIP, customIPs, psName) {
       let uniqueName = nameParts.join('#').trim();
       addressPart = addressPart.trim();
       let [ip, port] = parseAddressPort(addressPart);
-      const path = proxyIP ? `/proxyip=${proxyIP}` : "/";
+      let path = proxyIP ? `/proxyip=${proxyIP}` : "/";
+      // ADDSUB 的 ?proxyip=true：该地址既作入口又作反代，path 换成 /proxyip=<自身>
+      if (pipSet && pipSet.size) {
+          for (const p of pipSet) { if (p && p.includes(ip)) { path = `/proxyip=${p}`; break; } }
+      }
       let nodeName = uniqueName || ip; if (psName) nodeName = `${nodeName}${separator}`;
       const vLink = `${P_V}://${uuid}@${formatHostForUrl(ip)}:${port}${commonUrlPart}&path=${encodeURIComponent(path)}#${encodeURIComponent(nodeName)}`;
       result.push(vLink);
@@ -2303,6 +2330,240 @@ async function getCustomIPs(env, dlsThreshold) {
     }
     return allIPs;
 }
+
+/* =============================================================================
+ * 🔗 ADDSUB 汇聚订阅
+ * 一个输入框混写多种内容，按「内容特征」自动分类（从具体到宽泛）：
+ *   ① sub://xxx 或 sub=xxx   → 优选订阅生成器（哨兵探测，只取地址，套本项目模板）
+ *   ② http(s)://xxx          → 远程抓取，按【返回内容】再分流：
+ *                               含 :// = 节点订阅 → 原样透传
+ *                               否则   = IP列表/CSV → 套本项目模板
+ *   ③ 其他含 ://             → 现成节点链接 → 原样透传
+ *   ④ 其余                   → 优选 IP / 域名 → 套本项目模板
+ * 透传节点不注入 ECH/fp/PS：外部节点有自己的 host/sni，注入会打挂。
+ * 单源失败静默跳过，不影响其余源。
+ * ===========================================================================*/
+const AGG_TIMEOUT = 5000;
+const AGG_ID = '00000000-0000-4000-8000-000000000000';
+const AGG_HOST = 'example.com';
+
+function classifyAgg(list) {
+    const subGen = [], fetchUrls = [], rawLinks = [], plainIPs = [];
+    for (const item of list) {
+        const raw = String(item || '').trim();
+        if (!raw || raw.startsWith('#')) continue;
+        const low = raw.toLowerCase();
+        if (low.startsWith('sub://')) { subGen.push(raw); continue; }
+        const hi = raw.indexOf('#');
+        const addrPart = hi > -1 ? raw.slice(0, hi) : raw;
+        const subMatch = raw.match(/sub\s*=\s*([^\s&#]+)/i);
+        const subVal = subMatch ? subMatch[1].trim().split('?')[0] : '';
+        if (subVal && subVal.includes('.')) {
+            const pip = low.includes('proxyip=true') ? '?proxyip=true' : '';
+            subGen.push('sub://' + subVal + pip + (hi > -1 ? raw.slice(hi) : ''));
+        } else if (/^https?:\/\//i.test(addrPart)) {
+            fetchUrls.push(raw);
+        } else if (addrPart.includes('://')) {
+            rawLinks.push(raw);
+        } else {
+            plainIPs.push(raw);
+        }
+    }
+    return { subGen, fetchUrls, rawLinks, plainIPs };
+}
+
+const _aggTag = (s, tag) => !tag ? s : (s.includes('#') ? s + ' [' + tag + ']' : s + '#[' + tag + ']');
+
+const _aggTagLinks = (text, tag) => !tag ? text : text.replace(
+    /([a-z][a-z0-9+\-.]*:\/\/[^\r\n]*?)(\r?\n|$)/gi,
+    (m, link, eol) => link + encodeURIComponent(link.includes('#') ? ' [' + tag + ']' : '#[' + tag + ']') + eol
+);
+
+// 双编码解码（UTF-8 / GBK，以 U+FFFD 替换字符判断编码是否猜对）
+const _aggDecode = (buf, ctype) => {
+    const cs = (String(ctype || '').toLowerCase().match(/charset=([^\s;]+)/i) || [])[1] || '';
+    const order = /gb/.test(cs) ? ['gb18030', 'utf-8'] : ['utf-8', 'gb18030'];
+    for (const enc of order) {
+        try {
+            const s = new TextDecoder(enc).decode(buf);
+            if (s && !s.includes('�')) return s;
+        } catch (e) {}
+    }
+    try { return new TextDecoder('utf-8').decode(buf); } catch (e) { return ''; }
+};
+
+// base64 盲试：长度为 4 的倍数 + 仅含 base64 字母表 + 解码成功
+// 复用 b64uToU8 手动查表解码，不引入新的解码函数特征
+const _aggUnb64 = (text) => {
+    const c = String(text || '').replace(/\s/g, '');
+    if (!c.length || c.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(c)) return text;
+    const b = b64uToU8(c);
+    if (!b || !b.length) return text;
+    try {
+        const s = new TextDecoder('utf-8', { fatal: true }).decode(b);
+        return s || text;
+    } catch (e) { return text; }
+};
+
+// 从一行 IP 文本补齐端口：行内自带 > URL 的 ?port= > 默认 443
+// 裸 IPv6（多冒号且无方括号）统一补成 [v6]:port，避免被误判为「缺端口的域名」
+const _aggFillPort = (line, defPort) => {
+    const hi = line.indexOf('#');
+    const hostPart = hi > -1 ? line.slice(0, hi) : line;
+    const remark = hi > -1 ? line.slice(hi) : '';
+    if (hostPart.startsWith('[')) {
+        return /\]:(\d+)$/.test(hostPart) ? line : hostPart + ':' + defPort + remark;
+    }
+    if ((hostPart.match(/:/g) || []).length > 1) {   // 裸 IPv6
+        return '[' + hostPart + ']:' + defPort + remark;
+    }
+    const ci = hostPart.lastIndexOf(':');
+    if (ci > -1 && /^\d+$/.test(hostPart.slice(ci + 1))) return line;
+    return hostPart + ':' + defPort + remark;
+};
+
+// CSV 解析：靠表头名定位列，不猜固定下标
+const _aggParseCsv = (lines, defPort) => {
+    const out = [];
+    const H = lines[0].split(',').map(h => h.trim());
+    const V6 = /^[^\[\]]*:[^\[\]]*:[^\[\]]*$/;
+    const wrap = v => (v && !v.startsWith('[') && V6.test(v)) ? '[' + v + ']' : v;
+    const rows = lines.slice(1);
+    if (H.includes('IP地址') && H.includes('端口') && H.includes('数据中心')) {
+        const ipI = H.indexOf('IP地址'), poI = H.indexOf('端口'), tlsI = H.indexOf('TLS');
+        const rmI = H.indexOf('国家') > -1 ? H.indexOf('国家') : H.indexOf('城市') > -1 ? H.indexOf('城市') : H.indexOf('数据中心');
+        for (const row of rows) {
+            const c = row.split(',').map(x => x.trim());
+            if (!c[ipI]) continue;
+            if (tlsI !== -1 && String(c[tlsI] || '').toLowerCase() !== 'true') continue;
+            out.push(wrap(c[ipI]) + ':' + (c[poI] || defPort) + '#' + (c[rmI] || c[ipI]));
+        }
+    } else if (H.some(h => h.includes('IP')) && H.some(h => h.includes('延迟')) && H.some(h => h.includes('下载速度'))) {
+        const ipI = H.findIndex(h => h.includes('IP'));
+        const dI = H.findIndex(h => h.includes('延迟'));
+        const sI = H.findIndex(h => h.includes('下载速度'));
+        for (const row of rows) {
+            const c = row.split(',').map(x => x.trim());
+            if (!c[ipI]) continue;
+            out.push(wrap(c[ipI]) + ':' + defPort + '#CF' + (c[dI] ? ' ' + c[dI] + 'ms' : '') + (c[sI] ? ' ' + c[sI] + 'MB/s' : ''));
+        }
+    }
+    return out;
+};
+
+// 通道一：http(s) 远程源 → 按返回内容分流（节点订阅透传 / IP列表套模板）
+async function fetchAggSource(entry) {
+    const hi = entry.indexOf('#');
+    const urlNoHash = hi > -1 ? entry.slice(0, hi) : entry;
+    let tag = null;
+    if (hi > -1) { try { tag = decodeURIComponent(entry.slice(hi + 1)); } catch (e) { tag = entry.slice(hi + 1); } }
+    const asPip = entry.toLowerCase().includes('proxyip=true');
+    const ips = [], links = [], pips = [];
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), AGG_TIMEOUT);
+    try {
+        const res = await fetch(urlNoHash, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: ac.signal });
+        if (!res.ok) return { ips, links, pips };
+        const raw = _aggDecode(await res.arrayBuffer(), res.headers.get('content-type'));
+        if (!raw || !raw.trim()) return { ips, links, pips };
+        const text = _aggUnb64(raw);
+        // 内容判类：含 :// → 节点订阅，原样透传
+        if (text.split('#')[0].includes('://')) {
+            links.push(_aggTagLinks(text.trim(), tag));
+            return { ips, links, pips };
+        }
+        let defPort = '443';
+        try { defPort = new URL(urlNoHash).searchParams.get('port') || '443'; } catch (e) {}
+        const lines = text.trim().split('\n').map(l => l.trim()).filter(Boolean);
+        const parsed = (lines.length > 1 && lines[0].includes(','))
+            ? _aggParseCsv(lines, defPort)
+            : lines.filter(l => !l.startsWith('#')).map(l => _aggFillPort(l, defPort));
+        for (const it of parsed) {
+            ips.push(_aggTag(it, tag));
+            if (asPip) pips.push(it.split('#')[0]);
+        }
+    } catch (e) {} finally { clearTimeout(tid); }
+    return { ips, links, pips };
+}
+
+// 通道二：sub:// 优选订阅生成器 → 哨兵探测，剥出对方优选地址，套本项目模板
+async function fetchSubGenerator(entry) {
+    const hi = entry.indexOf('#');
+    let tag = null;
+    if (hi > -1) { try { tag = decodeURIComponent(entry.slice(hi + 1)); } catch (e) { tag = entry.slice(hi + 1); } }
+    const asPip = entry.toLowerCase().includes('proxyip=true');
+    const ips = [], links = [], pips = [];
+    let origin = entry.split('#')[0].replace(/^sub:\/\//i, '').split('?')[0];
+    if (!/^https?:\/\//i.test(origin)) origin = 'https://' + origin;   // 未写协议默认 https；显式 http:// 保留
+    try { origin = new URL(origin).origin; } catch (e) { return { ips, links, pips }; }
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), AGG_TIMEOUT);
+    try {
+        const res = await fetch(origin + '/sub?host=' + AGG_HOST + '&uuid=' + AGG_ID, {
+            headers: { 'User-Agent': 'Mozilla/5.0 v2' + 'rayN' }, signal: ac.signal
+        });
+        if (!res.ok) return { ips, links, pips };
+        const body = (await res.text()).trim();
+        const plain = _aggUnb64(body);
+        for (const line of plain.split(/\r?\n/)) {
+            const t = line.trim();
+            if (!t) continue;
+            // 双哨兵命中 → 该行地址栏就是对方的优选地址
+            if (t.includes(AGG_ID) && t.includes(AGG_HOST)) {
+                const m = t.match(/:\/\/[^@]+@([^?#]+)/);
+                if (!m) continue;
+                let remark = '';
+                const rm = t.match(/#(.+)$/);
+                if (rm) { try { remark = '#' + decodeURIComponent(rm[1]); } catch (e) { remark = '#' + rm[1]; } }
+                const item = m[1] + remark;
+                ips.push(_aggTag(item, tag));
+                if (asPip) pips.push(m[1]);
+            } else {
+                links.push(_aggTagLinks(t, tag));   // 对方自有节点 → 透传
+            }
+        }
+    } catch (e) {} finally { clearTimeout(tid); }
+    return { ips, links, pips };
+}
+
+/* 汇总入口：返回 { ips, links, pipSet, fetchUrls, rawLinks }
+ * ips      → 与 ADD/ADDAPI/ADDCSV 合并后套本项目节点模板
+ * links    → 原样透传，排在订阅最前
+ * pipSet   → ?proxyip=true 标记的地址，genNodes 生成 per-IP path 用
+ * fetchUrls/rawLinks → 供订阅转换路径拼 | 多源参数（原始条目，未抓取） */
+async function getAggregated(env) {
+    const empty = { ips: [], links: [], pipSet: null, fetchUrls: [], rawLinks: [] };
+    let text = '';
+    try { text = await getSafeEnv(env, 'ADDSUB', ''); } catch (e) { return empty; }
+    if (!text || !String(text).trim()) return empty;
+    const { subGen, fetchUrls, rawLinks, plainIPs } = classifyAgg(splitNodeList(text));
+    if (!subGen.length && !fetchUrls.length && !rawLinks.length && !plainIPs.length) return empty;
+    const ips = [...plainIPs], links = [], pips = [];
+    for (const l of rawLinks) {
+        const hi = l.indexOf('#');
+        if (hi > -1) {
+            let rk = l.slice(hi + 1);
+            try { rk = decodeURIComponent(rk); } catch (e) {}
+            links.push(l.slice(0, hi) + '#' + encodeURIComponent(rk));
+        } else links.push(l);
+    }
+    const tasks = [...fetchUrls.map(u => fetchAggSource(u)), ...subGen.map(s => fetchSubGenerator(s))];
+    const settled = await Promise.allSettled(tasks);
+    for (const r of settled) {
+        if (r.status !== 'fulfilled' || !r.value) continue;
+        ips.push(...r.value.ips);
+        links.push(...r.value.links);
+        pips.push(...r.value.pips);
+    }
+    const linkLines = [...new Set(links.join('\n').split(/\r?\n/).map(s => s.trim()).filter(Boolean))];
+    return {
+        ips: [...new Set(ips)],
+        links: linkLines,
+        pipSet: pips.length ? new Set(pips) : null,
+        fetchUrls, rawLinks
+    };
+}
+
 
 function loginPage(tgGroup, siteUrl, githubUrl, pageTitle) {
     const _s = (s) => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -2491,7 +2752,7 @@ function loginPage(tgGroup, siteUrl, githubUrl, pageTitle) {
 }
 
 // 👇 修改：增加 proxyCheckUrl 参数
-function dashPage(host, uuid, proxyip, subpass, subdomain, converter, subToken, env, clientIP, hasAuth, tgState, cfState, add, addApi, addCsv, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams, dashTitle, proxyCheckUrl, dls, echEnabled, echSni, echDns, statsEnabled, statsChatId, zoneId) {
+function dashPage(host, uuid, proxyip, subpass, subdomain, converter, subToken, env, clientIP, hasAuth, tgState, cfState, add, addApi, addCsv, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams, dashTitle, proxyCheckUrl, dls, echEnabled, echSni, echDns, statsEnabled, statsChatId, zoneId, addSub) {
     const defaultSubLink = `https://${host}/${subpass}`;
     const pathParam = proxyip ? "/proxyip=" + proxyip : "/";
     const linkParams = `${'enc'+'ryption'}=none&${'secu'+'rity'}=tls&sni=${host}&alpn=h3&fp=${FP}&allowInsecure=0&type=ws&host=${host}&path=${encodeURIComponent(pathParam)}` + (ECH ? `&ech=${encodeURIComponent((ECH_SNI ? ECH_SNI + '+' : '') + ECH_DNS)}` : '');
@@ -4398,6 +4659,22 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, subToken, 
                         <label>DLS (ADDCSV专用) - 速度下限筛选 (单位: MB/s)</label>
                         <input type="text" id="inpDls" placeholder="7" value="${safeVal(dls)}">
                     </div>
+                    <div style="margin:18px 0 12px;padding-top:16px;border-top:1px solid var(--border)">
+                        <div class="card-title" style="margin-bottom:10px;font-size:1rem"><span class="icon">🔗</span> ADDSUB - 汇聚订阅</div>
+                        <div style="font-size:0.8rem;color:var(--glass-cyan);margin-bottom:12px;padding:10px;background:rgba(0,245,255,0.06);border-left:3px solid var(--glass-blue);line-height:1.8">
+                            一个框内可混写以下 <b>五类</b>内容，系统按内容特征自动识别，分隔方式同上（换行 / 空格 / 逗号）：<br>
+                            ① <b>优选域名 / IP</b>　<code>www.visa.cn#优选域名</code>　<code>104.24.0.232:8443#优选v4</code>　<code>[2606:4700::]:2053#优选v6</code><br>
+                            ② <b>优选 IP API</b>（返回 IP 列表的 TXT/CSV）　<code>https://raw.githubusercontent.com/.../best_ips.txt#优选v4</code><br>
+                            ③ <b>机场订阅</b>（返回节点的订阅地址）　<code>https://69yun69.net/auth/register?code=X#69云机场</code><br>
+                            ④ <b>优选订阅生成器</b>　<code>sub://sub.example.net#CM优选订阅</code><br>
+                            ⑤ <b>现成节点链接</b>　<code>vl</code><code>ess://uuid@host:443?type=ws&amp;host=...</code><br>
+                            <span style="color:var(--text-dim)">② 与 ③ 写法相同，靠<b>抓回来的内容</b>自动区分（含 <code>://</code> 即视为节点订阅）。</span><br>
+                            💡 <b>① ② ④</b> 得到的是地址，会套用本项目的节点模板（含 ECH / 指纹）；<b>③ ⑤</b> 是别人的完整节点，<b>原样透传不加工</b>并排在订阅最前。<br>
+                            💡 在任意 <b>②</b> 条目后加 <code>?proxyip=true</code>，该源的 IP 会同时作为该节点的反代地址（path 自动变为 <code>/proxyip=自身</code>）。<br>
+                            ⚠️ 单个源抓取失败会静默跳过，不影响其余源；超时 5 秒。
+                        </div>
+                        <textarea id="inpAddSub" style="min-height:130px" placeholder="www.visa.cn#优选域名&#10;https://raw.githubusercontent.com/xxx/best_ips.txt#优选IP_API&#10;https://69yun69.net/auth/register?code=X#69云机场&#10;sub://sub.example.net#CM优选订阅">${safeVal(addSub)}</textarea>
+                    </div>
                     <button class="btn btn-success" style="width:100%" onclick="saveNodeConfig()">💾 保存配置</button>
                 </div>
             </div>
@@ -4705,7 +4982,7 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, subToken, 
 
         // ⭐ 功能4: 保存 DLS 配置
         function saveNodeConfig() {
-            const data = { ADD: val('inpAdd'), ADDAPI: val('inpAddApi'), ADDCSV: val('inpAddCsv'), DLS: val('inpDls') };
+            const data = { ADD: val('inpAdd'), ADDAPI: val('inpAddApi'), ADDCSV: val('inpAddCsv'), DLS: val('inpDls'), ADDSUB: val('inpAddSub') };
             saveConfig(data, null);
         }
 
